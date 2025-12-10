@@ -6,7 +6,9 @@ Utilities for:
 2. Deduplicating and merging with previous catalogues.
 3. Finding the latest YYMMDD catalogue file.
 """
-
+import csv
+import json
+from tqdm import tqdm
 import requests
 import pandas as pd
 import re
@@ -156,13 +158,81 @@ def load_existing_catalogues() -> pd.DataFrame:
 
     combined = pd.concat(frames, ignore_index=True)
     return combined
+# ---------------------------
+# CMU Book Summary Dataset integration
+# ---------------------------
+
+def load_cmu_books(path: str = "/kaggle/input/cmu-book-summary-dataset/booksummaries.txt"):
+    """
+    Load the CMU Book Summary dataset (tab-separated).
+
+    Each row:
+    [wiki_id, freebase_id, title, author, pub_date, genres_json, summary]
+    """
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f, dialect="excel-tab")
+        for row in tqdm(reader, desc="Loading CMU summaries"):
+            if not row:
+                continue
+            rows.append(row)
+    return rows
+
+
+def build_cmu_df(cmu_rows) -> pd.DataFrame:
+    """
+    Turn raw CMU rows into a DataFrame with clean columns:
+    wiki_id, freebase_id, title, author, pub_date, genres_raw, genres_list, summary
+    """
+    processed = []
+
+    for row in cmu_rows:
+        if len(row) < 7:
+            continue
+
+        wiki_id = row[0]
+        freebase_id = row[1]
+        title = row[2]
+        author = row[3]
+        pub_date = row[4]
+        genres_raw = row[5]
+        summary = row[6]
+
+        # genres_raw is a dict-like string; normalise to a simple list of genre names
+        genres_list = []
+        if genres_raw:
+            try:
+                # CMU uses single quotes, invalid JSON → fix them
+                genre_dict = json.loads(genres_raw.replace("'", '"'))
+                if isinstance(genre_dict, dict):
+                    genres_list = list(genre_dict.keys())
+            except Exception:
+                # if parsing fails, leave genres_list empty but keep raw string
+                genres_list = []
+
+        processed.append(
+            {
+                "wiki_id": wiki_id,
+                "freebase_id": freebase_id,
+                "cmu_title": title,
+                "cmu_author": author,
+                "cmu_pub_date": pub_date,
+                "cmu_genres_raw": genres_raw,
+                "cmu_genres_list": "; ".join(genres_list),
+                "cmu_summary": summary,
+            }
+        )
+
+    return pd.DataFrame(processed)
 
 
 def build_weekly_catalogue(
     published_after: Optional[int] = None,
+    cmu_path: str = "/kaggle/input/cmu-book-summary-dataset/booksummaries.txt",
 ) -> Path:
     """
-    Fetch new fantasy data, merge with prior catalogues, dedupe, and write new YYMMDD file.
+    Fetch new fantasy data from Open Library, merge with prior catalogues,
+    dedupe, enrich with CMU Book Summary dataset, and write new YYMMDD file.
 
     Returns:
         Path to the newly written catalogue CSV.
@@ -170,8 +240,10 @@ def build_weekly_catalogue(
     today_code = datetime.today().strftime("%y%m%d")
     out_path = DATA_DIR / f"catalogue_{today_code}.csv"
 
+    # 1. Fetch fresh Open Library fantasy data
     new_df = fetch_openlibrary_fantasy(published_after=published_after)
 
+    # 2. Load existing catalogue (if any)
     existing_df = load_existing_catalogues()
 
     if not existing_df.empty:
@@ -179,11 +251,30 @@ def build_weekly_catalogue(
     else:
         combined = new_df
 
+    # 3. Dedupe
     combined = dedupe_catalogue(combined)
 
-    combined.to_csv(out_path, index=False)
+    # 4. Load and build CMU DF
+    try:
+        cmu_rows = load_cmu_books(cmu_path)
+        cmu_df = build_cmu_df(cmu_rows)
+        combined = enrich_with_cmu(combined, cmu_df)
+    except FileNotFoundError:
+        print(f"Warning: CMU dataset not found at {cmu_path}. Skipping CMU enrichment.")
+    except Exception as e:
+        print(f"Warning: failed to enrich with CMU dataset: {e}")
 
+    # 5. Basic schema completion (optional: ensure summary/genre/type exist)
+    if "type" not in combined.columns:
+        combined["type"] = "fiction"  # everything here is fantasy
+    if "genre" not in combined.columns:
+        combined["genre"] = "Fantasy"
+    if "summary" not in combined.columns:
+        combined["summary"] = pd.NA
+
+    combined.to_csv(out_path, index=False)
     return out_path
+
 # ---------------------------
 # 2b. Normalise / complete schema
 # ---------------------------
@@ -280,6 +371,79 @@ def normalise_catalogue_schema(df: pd.DataFrame) -> pd.DataFrame:
     # PAGE COUNT: leave as-is if present; otherwise stays NA until enriched elsewhere
 
     return df
+def normalise_str(s):
+    if not isinstance(s, str):
+        return ""
+    return (
+        s.lower()
+        .strip()
+        .replace(".", "")
+        .replace(",", "")
+        .replace(":", "")
+        .replace(";", "")
+        .replace("!", "")
+        .replace("?", "")
+    )
+
+
+def enrich_with_cmu(base_df: pd.DataFrame, cmu_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Match Open Library catalogue to CMU Book Summary dataset by (title, author)
+    and enrich with:
+      - genre (from cmu_genres_list)
+      - summary (from cmu_summary)
+
+    Notes:
+      - We do a simple normalised exact match on title + author.
+      - If a row already has 'genre' or 'summary', CMU only fills missing values.
+    """
+    df = base_df.copy()
+
+    # normalised keys for join
+    df["title_norm"] = df["title"].fillna("").apply(normalise_str)
+    df["author_norm"] = df["authors"].fillna("").apply(normalise_str)
+
+    cmu = cmu_df.copy()
+    cmu["cmu_title_norm"] = cmu["cmu_title"].fillna("").apply(normalise_str)
+    cmu["cmu_author_norm"] = cmu["cmu_author"].fillna("").apply(normalise_str)
+
+    # build small key to join on
+    df["match_key"] = df["title_norm"] + "::" + df["author_norm"]
+    cmu["match_key"] = cmu["cmu_title_norm"] + "::" + cmu["cmu_author_norm"]
+
+    # drop duplicates on CMU side (keep first)
+    cmu_small = cmu[
+        ["match_key", "cmu_genres_list", "cmu_summary"]
+    ].drop_duplicates(subset="match_key", keep="first")
+
+    merged = df.merge(cmu_small, on="match_key", how="left")
+
+    # ensure genre + summary columns exist
+    if "genre" not in merged.columns:
+        merged["genre"] = pd.NA
+    if "summary" not in merged.columns:
+        merged["summary"] = pd.NA
+
+    # fill missing genre/summary from CMU
+    mask_genre_missing = merged["genre"].isna() | (merged["genre"].astype(str).str.strip() == "")
+    merged.loc[mask_genre_missing, "genre"] = merged["cmu_genres_list"]
+
+    mask_summary_missing = merged["summary"].isna() | (merged["summary"].astype(str).str.strip() == "")
+    merged.loc[mask_summary_missing, "summary"] = merged["cmu_summary"]
+
+    # clean up helper columns
+    merged = merged.drop(
+        columns=[
+            "title_norm",
+            "author_norm",
+            "match_key",
+            "cmu_genres_list",
+            "cmu_summary",
+        ],
+        errors="ignore",
+    )
+
+    return merged
 
 
 # ---------------------------
