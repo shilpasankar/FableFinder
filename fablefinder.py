@@ -184,6 +184,102 @@ def build_weekly_catalogue(
     combined.to_csv(out_path, index=False)
 
     return out_path
+# ---------------------------
+# 2b. Normalise / complete schema
+# ---------------------------
+
+EXPECTED_COLUMNS = [
+    "openlibrary_id",
+    "title",
+    "authors",
+    "first_publish_year",
+    "subjects",
+    "edition_count",
+    "work_key",
+    "cover_id",
+    # "semantic" fields used by the app:
+    "type",
+    "genre",
+    "mood",
+    "pace",
+    "tropes",
+    "hero_heroine",
+    "devices",
+    "page_count",
+    "in_series",
+    "series_name",
+    "series_length",
+    "owned",
+    "to_read",
+]
+
+
+def infer_genre_from_subjects(subjects_str: str) -> str:
+    """
+    Very rough heuristic to turn subjects into a coarse 'genre' string.
+    This runs on each row; it's okay if it's not perfect – you can overwrite later.
+    """
+    if not isinstance(subjects_str, str):
+        return "Fantasy"
+
+    s = subjects_str.lower()
+
+    if "urban fantasy" in s:
+        return "Urban Fantasy"
+    if "young adult" in s or "ya fiction" in s:
+        return "YA Fantasy"
+    if "children" in s or "juvenile fiction" in s:
+        return "Middle Grade / Children"
+    if "grimdark" in s or "dark fantasy" in s:
+        return "Grimdark"
+    if "cozy" in s or "comfort read" in s:
+        return "Cozy Fantasy"
+    if "mythology" in s or "folklore" in s:
+        return "Mythic Fantasy"
+
+    # Fallback
+    return "Fantasy"
+
+
+def normalise_catalogue_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure the catalogue has all columns the Streamlit app expects,
+    with sensible defaults where we can infer them.
+    """
+    df = df.copy()
+
+    # Make sure all EXPECTED_COLUMNS exist
+    for col in EXPECTED_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # TYPE: default all fantasy books to 'fiction' unless already set
+    if "type" in df.columns:
+        df["type"] = df["type"].fillna("fiction")
+
+    # GENRE: infer from subjects if missing/empty
+    if "genre" in df.columns:
+        mask_empty = df["genre"].isna() | (df["genre"].astype(str).str.strip() == "")
+        df.loc[mask_empty, "genre"] = df.loc[mask_empty, "subjects"].apply(infer_genre_from_subjects)
+
+    # BOOLS: in_series, owned, to_read – normalise to True/False/NA
+    for bool_col in ["in_series", "owned", "to_read"]:
+        if bool_col in df.columns:
+            df[bool_col] = df[bool_col].map(
+                lambda x: True if x is True or str(x).lower() in ["true", "1", "yes", "y"]
+                else False if x is False or str(x).lower() in ["false", "0", "no", "n"]
+                else pd.NA
+            )
+
+    # SERIES LENGTH: if missing but we know it's not series, set to 1 (standalone)
+    if "series_length" in df.columns and "in_series" in df.columns:
+        # if series_length is NaN and in_series is False/NA, call it 1 (standalone)
+        mask = df["series_length"].isna() & (df["in_series"] != True)
+        df.loc[mask, "series_length"] = 1
+
+    # PAGE COUNT: leave as-is if present; otherwise stays NA until enriched elsewhere
+
+    return df
 
 
 # ---------------------------
