@@ -6,9 +6,14 @@ Utilities for:
 2. Deduplicating and merging with previous catalogues.
 3. Finding the latest YYMMDD catalogue file.
 """
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
 import csv
 import json
-from tqdm import tqdm
 import requests
 import pandas as pd
 import re
