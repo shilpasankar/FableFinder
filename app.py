@@ -55,7 +55,6 @@ def apply_filters(
     exclude_genres,
     include_tags,
     exclude_tags,
-    series_mode: str,
 ):
     debug = []
 
@@ -70,31 +69,6 @@ def apply_filters(
         debug.append(f"Year {year_min}-{year_max}: {len(filtered)} (was {before})")
     else:
         debug.append("No 'first_publish_year' column – year filter skipped.")
-
-    # series mode (only if columns exist)
-    if series_mode != "All books":
-        if "in_series" in filtered.columns:
-            before = len(filtered)
-            if series_mode == "Books not in a series":
-                filtered = filtered[(filtered["in_series"] == False) | (filtered["in_series"].isna())]
-            else:  # Books in a series
-                filtered = filtered[filtered["in_series"] == True]
-            debug.append(f"{series_mode}: {len(filtered)} (was {before})")
-        elif "series_name" in filtered.columns:
-            before = len(filtered)
-            if series_mode == "Books not in a series":
-                filtered = filtered[
-                    filtered["series_name"].isna()
-                    | (filtered["series_name"].astype(str).str.strip() == "")
-                ]
-            else:
-                filtered = filtered[
-                    filtered["series_name"].notna()
-                    & (filtered["series_name"].astype(str).str.strip() != "")
-                ]
-            debug.append(f"{series_mode} via series_name: {len(filtered)} (was {before})")
-        else:
-            debug.append(f"{series_mode} selected but no series column found; ignoring.")
 
     # genre include/exclude
     if "genre" in filtered.columns:
@@ -203,17 +177,6 @@ def main():
     with st.sidebar:
         st.header("🔍 Filters")
 
-        # series mode
-        series_mode = st.radio(
-            "Search only:",
-            options=[
-                "All books",
-                "Books not in a series",
-                "Books in a series",
-            ],
-            index=0,
-        )
-
         # year range
         if df["first_publish_year"].notna().any():
             min_year = int(df["first_publish_year"].min())
@@ -272,7 +235,6 @@ def main():
         exclude_genres=exclude_genres,
         include_tags=include_tags,
         exclude_tags=exclude_tags,
-        series_mode=series_mode,
     )
 
     with st.expander("Debug: filter steps", expanded=False):
