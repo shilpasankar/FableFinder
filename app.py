@@ -4,12 +4,45 @@ import pandas as pd
 from fablefinder import load_latest_catalogue, get_latest_catalogue_path
 
 
+# ---------- defaults for filters (so they’re never empty) ----------
+
+DEFAULT_GENRES = [
+    "Epic Fantasy",
+    "Urban Fantasy",
+    "Grimdark",
+    "Cozy Fantasy",
+    "YA Fantasy",
+    "Mythic",
+    "Portal Fantasy",
+]
+
+DEFAULT_PACE = ["slow", "medium", "fast"]
+
+DEFAULT_HERO_TYPES = [
+    "female lead",
+    "male lead",
+    "non-binary lead",
+    "ensemble cast",
+    "anti-hero",
+    "reluctant hero",
+]
+
+DEFAULT_DEVICES = [
+    "multiple POV",
+    "unreliable narrator",
+    "non-linear timeline",
+    "frame narrative",
+    "epistolary",
+    "breaking the fourth wall",
+]
+
+
 # ---------- helpers for token-like columns ----------
 
 def explode_tokens(series: pd.Series, delimiters=(",",";")):
     """
     Turn a column of strings like "cozy; whimsical, low stakes"
-    into a flat set of unique tokens.
+    into a flat sorted list of unique tokens.
     """
     tokens = set()
     for val in series.dropna().astype(str):
@@ -58,7 +91,8 @@ def apply_filters(
     include_devices,
     exclude_devices,
     page_buckets,
-    ownership_mode: str,
+    series_mode: str,
+    series_length_filters,
 ) -> pd.DataFrame:
     filtered = df.copy()
 
@@ -67,24 +101,43 @@ def apply_filters(
         fp = filtered["first_publish_year"].fillna(0)
         filtered = filtered[(fp >= year_min) & (fp <= year_max)]
 
-    # --- ownership / series filter ---
-    if ownership_mode == "Books I own":
-        if "owned" in filtered.columns:
-            filtered = filtered[filtered["owned"] == True]
-        else:
-            st.warning("Ownership filter selected but 'owned' column not found.")
-    elif ownership_mode == "Books in my to-read pile":
-        if "to_read" in filtered.columns:
-            filtered = filtered[filtered["to_read"] == True]
-        else:
-            st.warning("To-read filter selected but 'to_read' column not found.")
-    elif ownership_mode == "Books not in a series":
+    # --- series mode filter (search only) ---
+    # modes: "All books", "Books not in a series", "Books in a series"
+    if series_mode == "Books not in a series":
         if "in_series" in filtered.columns:
             filtered = filtered[(filtered["in_series"] == False) | (filtered["in_series"].isna())]
         elif "series_name" in filtered.columns:
-            filtered = filtered[filtered["series_name"].isna() | (filtered["series_name"].astype(str).str.strip() == "")]
-        else:
-            st.warning("Series filter selected but neither 'in_series' nor 'series_name' columns found.")
+            filtered = filtered[
+                filtered["series_name"].isna()
+                | (filtered["series_name"].astype(str).str.strip() == "")
+            ]
+    elif series_mode == "Books in a series":
+        if "in_series" in filtered.columns:
+            filtered = filtered[filtered["in_series"] == True]
+        elif "series_name" in filtered.columns:
+            filtered = filtered[
+                filtered["series_name"].notna()
+                & (filtered["series_name"].astype(str).str.strip() != "")
+            ]
+
+    # --- series length filter (if we have a 'series_length' column) ---
+    # buckets: "Standalone (1)", "Duology (2)", "Trilogy (3)", "Short series (4–6)", "Long series (7+)"
+    if "series_length" in filtered.columns and series_length_filters:
+        sl = filtered["series_length"].fillna(1).astype(int)  # assume NaN = standalone
+
+        mask = pd.Series(False, index=filtered.index)
+        if "Standalone (1)" in series_length_filters:
+            mask |= (sl == 1)
+        if "Duology (2)" in series_length_filters:
+            mask |= (sl == 2)
+        if "Trilogy (3)" in series_length_filters:
+            mask |= (sl == 3)
+        if "Short series (4–6)" in series_length_filters:
+            mask |= (sl >= 4) & (sl <= 6)
+        if "Long series (7+)" in series_length_filters:
+            mask |= (sl >= 7)
+
+        filtered = filtered[mask]
 
     # --- page count bucket filter ---
     if "page_count" in filtered.columns and page_buckets:
@@ -147,7 +200,46 @@ def apply_filters(
     return filtered
 
 
-# ---------- UI ----------
+# ---------- grid render helpers ----------
+
+def render_book_grid(df: pd.DataFrame, max_books: int = 50):
+    """
+    Show books as small cards in a grid (5 per row).
+    """
+    display_df = df.head(max_books)
+
+    if display_df.empty:
+        st.write("No books to show.")
+        return
+
+    # iterate in chunks of 5
+    for start in range(0, len(display_df), 5):
+        row_slice = display_df.iloc[start:start+5]
+        cols = st.columns(len(row_slice))
+
+        for col, (_, book) in zip(cols, row_slice.iterrows()):
+            with col:
+                # cover
+                cover_id = book.get("cover_id", None)
+                if pd.notna(cover_id):
+                    cover_url = f"https://covers.openlibrary.org/b/id/{int(cover_id)}-M.jpg"
+                    # smaller image
+                    st.image(cover_url, use_container_width=False, width=110)
+                else:
+                    st.empty()
+
+                title = str(book.get("title", ""))
+                author = str(book.get("authors", ""))[:60]
+                year = book.get("first_publish_year", "")
+
+                st.markdown(f"**{title[:60]}{'…' if len(title) > 60 else ''}**")
+                if author:
+                    st.caption(author)
+                if pd.notna(year):
+                    st.caption(f"Year: {int(year)}")
+
+
+# ---------- main UI ----------
 
 def main():
     st.set_page_config(
@@ -157,7 +249,7 @@ def main():
     )
 
     st.title("FableFinder 🧙📚")
-    st.caption("Filter your fantasy catalogue by mood, pace, tropes, devices, and more.")
+    st.caption("Filter your fantasy catalogue by mood, pace, series length, tropes, and more.")
 
     latest_path = get_latest_catalogue_path()
     if latest_path is None:
@@ -180,18 +272,30 @@ def main():
         if col not in df.columns:
             df[col] = ""
 
+    # --- build option lists: default + data-driven ---
+    mood_options = explode_tokens(df["mood"]) if "mood" in df.columns else []
+    pace_options = list(sorted(set(DEFAULT_PACE +
+                                  (explode_tokens(df["pace"]) if "pace" in df.columns else []))))
+    type_options = ["fiction", "non-fiction"]
+    genre_options = list(sorted(set(DEFAULT_GENRES +
+                                   (explode_tokens(df["genre"]) if "genre" in df.columns else []))))
+    trope_options = explode_tokens(df["tropes"]) if "tropes" in df.columns else []
+    hero_options = list(sorted(set(DEFAULT_HERO_TYPES +
+                                  (explode_tokens(df["hero_heroine"]) if "hero_heroine" in df.columns else []))))
+    device_options = list(sorted(set(DEFAULT_DEVICES +
+                                    (explode_tokens(df["devices"]) if "devices" in df.columns else []))))
+
     # Sidebar filters
     with st.sidebar:
         st.header("🔍 Filters")
 
-        # Ownership / series selector
-        ownership_mode = st.radio(
+        # "Search only" = series mode
+        series_mode = st.radio(
             "Search only:",
             options=[
                 "All books",
-                "Books I own",
-                "Books in my to-read pile",
                 "Books not in a series",
+                "Books in a series",
             ],
             index=0,
         )
@@ -204,66 +308,100 @@ def main():
             min_year, max_year = 1800, 2025
 
         year_min, year_max = st.slider(
-            "First publish year range",
+            "First publish year",
             min_value=min_year,
             max_value=max_year,
             value=(min_year, max_year),
         )
 
         # Page count buckets
-        bucket_options = ["<300", "300–499", "500+",]
+        bucket_options = ["<300", "300–499", "500+"]
         page_buckets = st.multiselect(
             "Page count",
             options=bucket_options,
-            help="Apply 0, 1, or multiple page count buckets.",
+        )
+
+        # Series length filter
+        st.markdown("**Series length**")
+        series_length_filters = st.multiselect(
+            "Number of books in series",
+            options=[
+                "Standalone (1)",
+                "Duology (2)",
+                "Trilogy (3)",
+                "Short series (4–6)",
+                "Long series (7+)",
+            ],
+            help="Uses `series_length` column if available.",
         )
 
         st.markdown("---")
-        st.caption("Advanced filters:")
+        st.caption("Mood, pace, type, genre, tropes, hero, devices")
 
-        # Mood
-        mood_vals = explode_tokens(df["mood"]) if "mood" in df.columns else []
-        include_moods = st.multiselect("Include mood", options=mood_vals, key="inc_mood")
-        exclude_moods = st.multiselect("Exclude mood", options=mood_vals, key="exc_mood")
+        # Mood include/exclude side by side
+        st.markdown("**Mood**")
+        c1, c2 = st.columns(2)
+        with c1:
+            include_moods = st.multiselect("Include", options=mood_options, key="inc_mood")
+        with c2:
+            exclude_moods = st.multiselect("Exclude", options=mood_options, key="exc_mood")
 
-        # Pace
-        pace_vals = ["slow", "medium", "fast"]
-        include_pace = st.multiselect("Include pace", options=pace_vals, key="inc_pace")
-        exclude_pace = st.multiselect("Exclude pace", options=pace_vals, key="exc_pace")
+        # Pace include/exclude
+        st.markdown("**Pace**")
+        c1, c2 = st.columns(2)
+        with c1:
+            include_pace = st.multiselect("Include", options=pace_options, key="inc_pace")
+        with c2:
+            exclude_pace = st.multiselect("Exclude", options=pace_options, key="exc_pace")
 
-        # Type
-        type_vals = ["fiction", "non-fiction"]
-        include_type = st.multiselect("Include type", options=type_vals, key="inc_type")
-        exclude_type = st.multiselect("Exclude type", options=type_vals, key="exc_type")
+        # Type include/exclude
+        st.markdown("**Type**")
+        c1, c2 = st.columns(2)
+        with c1:
+            include_type = st.multiselect("Include", options=type_options, key="inc_type")
+        with c2:
+            exclude_type = st.multiselect("Exclude", options=type_options, key="exc_type")
 
-        # Genre
-        genre_vals = explode_tokens(df["genre"]) if "genre" in df.columns else []
-        include_genre = st.multiselect("Include genre", options=genre_vals, key="inc_genre")
-        exclude_genre = st.multiselect("Exclude genre", options=genre_vals, key="exc_genre")
+        # Genre include/exclude
+        st.markdown("**Genre**")
+        c1, c2 = st.columns(2)
+        with c1:
+            include_genre = st.multiselect("Include", options=genre_options, key="inc_genre")
+        with c2:
+            exclude_genre = st.multiselect("Exclude", options=genre_options, key="exc_genre")
 
-        # Tropes
-        trope_vals = explode_tokens(df["tropes"]) if "tropes" in df.columns else []
-        include_tropes = st.multiselect("Include tropes", options=trope_vals, key="inc_tropes")
-        exclude_tropes = st.multiselect("Exclude tropes", options=trope_vals, key="exc_tropes")
+        # Tropes include/exclude
+        st.markdown("**Tropes**")
+        c1, c2 = st.columns(2)
+        with c1:
+            include_tropes = st.multiselect("Include", options=trope_options, key="inc_tropes")
+        with c2:
+            exclude_tropes = st.multiselect("Exclude", options=trope_options, key="exc_tropes")
 
-        # Hero / heroine
-        hero_vals = explode_tokens(df["hero_heroine"]) if "hero_heroine" in df.columns else []
-        include_heroes = st.multiselect("Include hero/heroine", options=hero_vals, key="inc_heroes")
-        exclude_heroes = st.multiselect("Exclude hero/heroine", options=hero_vals, key="exc_heroes")
+        # Hero / heroine include/exclude
+        st.markdown("**Hero / Heroine**")
+        c1, c2 = st.columns(2)
+        with c1:
+            include_heroes = st.multiselect("Include", options=hero_options, key="inc_heroes")
+        with c2:
+            exclude_heroes = st.multiselect("Exclude", options=hero_options, key="exc_heroes")
 
-        # Devices
-        device_vals = explode_tokens(df["devices"]) if "devices" in df.columns else []
-        include_devices = st.multiselect("Include literary devices", options=device_vals, key="inc_devices")
-        exclude_devices = st.multiselect("Exclude literary devices", options=device_vals, key="exc_devices")
+        # Literary devices include/exclude
+        st.markdown("**Literary devices**")
+        c1, c2 = st.columns(2)
+        with c1:
+            include_devices = st.multiselect("Include", options=device_options, key="inc_devices")
+        with c2:
+            exclude_devices = st.multiselect("Exclude", options=device_options, key="exc_devices")
 
         st.markdown("---")
         search = st.text_input(
             "Free text search (optional)",
             placeholder="title, author, trope, device, etc.",
-            help="Leave empty to filter only by the controls above.",
+            help="Leave empty to use only the filters.",
         )
 
-    # Apply filters (search is allowed to be empty)
+    # Apply filters (search can be empty)
     filtered = apply_filters(
         df=df,
         search=search,
@@ -284,7 +422,8 @@ def main():
         include_devices=include_devices,
         exclude_devices=exclude_devices,
         page_buckets=page_buckets,
-        ownership_mode=ownership_mode,
+        series_mode=series_mode,
+        series_length_filters=series_length_filters,
     )
 
     st.subheader(f"Results ({len(filtered)})")
@@ -293,41 +432,34 @@ def main():
         st.warning("No books match your filters yet. Try relaxing one or two constraints.")
         return
 
-    # Layout: table + details
-    left, right = st.columns([1.5, 1])
+    # Grid of books at the top
+    st.markdown("### Books")
+    render_book_grid(filtered)
 
-    show_cols = [c for c in [
-        "title",
-        "authors",
-        "type",
-        "genre",
-        "mood",
-        "pace",
-        "first_publish_year",
-        "page_count",
-    ] if c in filtered.columns]
+    # Detailed pane below
+    st.markdown("---")
+    st.markdown("### Details")
+
+    options = [
+        f"{row.get('title', '')} — {row.get('authors','')} "
+        f"({int(row['first_publish_year']) if pd.notna(row.get('first_publish_year')) else 'n/a'})"
+        for _, row in filtered.iterrows()
+    ]
+    selected = st.selectbox("Pick a book for full details", options)
+
+    idx = options.index(selected)
+    book = filtered.iloc[idx]
+
+    left, right = st.columns([1, 2])
 
     with left:
-        st.dataframe(
-            filtered[show_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+        cover_id = book.get("cover_id", None)
+        if pd.notna(cover_id):
+            cover_url = f"https://covers.openlibrary.org/b/id/{int(cover_id)}-M.jpg"
+            st.image(cover_url, caption="Cover", use_container_width=False, width=130)
 
     with right:
-        st.subheader("Book details")
-
-        options = [
-            f"{row.get('title', '')} — {row.get('authors','')} "
-            f"({int(row['first_publish_year']) if pd.notna(row.get('first_publish_year')) else 'n/a'})"
-            for _, row in filtered.iterrows()
-        ]
-        selected = st.selectbox("Pick a book", options)
-
-        idx = options.index(selected)
-        book = filtered.iloc[idx]
-
-        st.markdown(f"### {book.get('title','')}")
+        st.markdown(f"#### {book.get('title','')}")
         st.markdown(f"*by {book.get('authors','')}*")
 
         if pd.notna(book.get("first_publish_year")):
@@ -351,27 +483,11 @@ def main():
         if "page_count" in book and pd.notna(book.get("page_count")):
             st.markdown(f"**Page count:** {int(book['page_count'])}")
 
-        # Ownership info if present
-        owned = book.get("owned", None)
-        to_read = book.get("to_read", None)
-        in_series = book.get("in_series", None)
+        if "series_length" in book and pd.notna(book.get("series_length")):
+            st.markdown(f"**Series length:** {int(book['series_length'])} book(s)")
 
-        meta_bits = []
-        if isinstance(owned, bool):
-            meta_bits.append("✅ Owned" if owned else "Not owned")
-        if isinstance(to_read, bool):
-            meta_bits.append("📌 In to-read pile" if to_read else "Not in to-read pile")
-        if isinstance(in_series, bool):
-            meta_bits.append("📚 Part of a series" if in_series else "Standalone")
-
-        if meta_bits:
-            st.markdown("**Status:** " + " · ".join(meta_bits))
-
-        # Cover if available
-        cover_id = book.get("cover_id", None)
-        if pd.notna(cover_id):
-            cover_url = f"https://covers.openlibrary.org/b/id/{int(cover_id)}-L.jpg"
-            st.image(cover_url, caption="Open Library cover", use_container_width=True)
+        if "series_name" in book and pd.notna(book.get("series_name")):
+            st.markdown(f"**Series name:** {book.get('series_name', '')}")
 
 
 if __name__ == "__main__":
